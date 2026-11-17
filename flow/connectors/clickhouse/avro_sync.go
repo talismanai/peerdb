@@ -270,6 +270,27 @@ func (s *ClickHouseAvroSyncMethod) writeToAvroFiles(
 	return avroFiles, totalRecords, nil
 }
 
+// snapshotInsertSettings keeps quorum acknowledgement while allowing concurrent snapshot inserts.
+// CDC normalization retains the connection's sequential quorum settings.
+func (s *ClickHouseAvroSyncMethod) snapshotInsertSettings(
+	ctx context.Context,
+	config *protos.QRepConfig,
+) (*clickhouse.CHSettings, error) {
+	chSettings := clickhouse.NewInsertSettings(s.chVersion, config.Version)
+	if s.Config.Replicated {
+		quorum, err := internal.PeerDBClickHouseEnableReplicatedQuorum(ctx, config.Env)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load replicated quorum config for snapshot: %w", err)
+		}
+		if quorum {
+			chSettings.Add(clickhouse.SettingInsertQuorum, "'auto'")
+			chSettings.Add(clickhouse.SettingInsertQuorumParallel, "1")
+			chSettings.Add(clickhouse.SettingSelectSequentialConsistency, "0")
+		}
+	}
+	return chSettings, nil
+}
+
 func (s *ClickHouseAvroSyncMethod) pushStagingDataToClickHouseForSnapshot(
 	ctx context.Context,
 	avroFiles []utils.AvroFile,
@@ -294,7 +315,10 @@ func (s *ClickHouseAvroSyncMethod) pushStagingDataToClickHouseForSnapshot(
 	}
 	numParts = max(numParts, 1)
 
-	chSettings := clickhouse.NewInsertSettings(s.chVersion, config.Version)
+	chSettings, err := s.snapshotInsertSettings(ctx, config)
+	if err != nil {
+		return err
+	}
 	// Process each chunk file individually
 	for chunkIdx, avroFile := range avroFiles {
 		s.logger.Info("processing chunk",
